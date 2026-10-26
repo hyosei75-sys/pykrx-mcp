@@ -102,7 +102,17 @@ def _etf_ohlcv(code: str, start: str, end: str) -> pd.DataFrame:
 
 
 def _index_ohlcv(idx: str, start: str, end: str) -> pd.DataFrame:
-    return _call("get_index_ohlcv", "get_index_ohlcv_by_date", start, end, idx)
+    """
+    ⚠️ `stock.get_index_ohlcv` 는 **인자 개수로 동작이 갈리는 오버로드 함수**입니다.
+       (3인자 = 기간별 지수 시세 / 1인자 = 특정일 전종목 시세)
+       분기를 잘못 타면 '지수명' 을 인덱스로 쓰는 전종목 DataFrame 이 돌아와
+       `KeyError: '지수명'` 이 납니다.
+       모호함을 없애기 위해 **`get_index_ohlcv_by_date` 를 직접** 부릅니다.
+    """
+    fn = getattr(stock, "get_index_ohlcv_by_date", None)
+    if fn is not None:
+        return fn(start, end, idx)
+    return stock.get_index_ohlcv(start, end, idx)
 
 
 def _is_etf(code: str) -> bool:
@@ -178,10 +188,12 @@ def health() -> dict[str, Any]:
         if df.empty:
             ok, detail = False, "pykrx가 빈 응답을 돌려줬습니다 (KRX 점검/휴장 가능)"
     except Exception as e:
-        ok, detail = False, f"pykrx 호출 실패: {e}"
+        # 예외 메시지만으로는 원인을 못 찾는 경우가 많아 타입과 pykrx 버전을 같이 남깁니다.
+        ok, detail = False, f"pykrx 호출 실패: {type(e).__name__}: {e}"
     return {
         "ok": ok,
         "detail": detail,
+        "pykrx_version": getattr(__import__("pykrx"), "__version__", "unknown"),
         "server_time_kst": today_kst().strftime("%Y-%m-%d %H:%M:%S"),
         "source": "KRX via pykrx",
     }
@@ -290,7 +302,8 @@ def get_index_ohlcv(
     try:
         df = _index_ohlcv(idx, months_ago(months), ymd(today_kst()))
     except Exception as e:
-        return {"index": index, "count": 0, "bars": [], "error": str(e),
+        return {"index": index, "count": 0, "bars": [],
+                "error": f"{type(e).__name__}: {e}",
                 "source": "KRX via pykrx"}
     bars = _rows(df)
     return {
