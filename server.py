@@ -108,11 +108,17 @@ def _index_ohlcv(idx: str, start: str, end: str) -> pd.DataFrame:
        분기를 잘못 타면 '지수명' 을 인덱스로 쓰는 전종목 DataFrame 이 돌아와
        `KeyError: '지수명'` 이 납니다.
        모호함을 없애기 위해 **`get_index_ohlcv_by_date` 를 직접** 부릅니다.
+
+    ⚠️ `name_display=False` 가 필수입니다. 기본값(True)이면 pykrx가 OHLCV를
+       정상적으로 받아온 **뒤에** 지수 이름을 따로 조회하는데
+       (`df.columns.name = get_index_ticker_name(ticker)`),
+       그 조회가 실패하면 데이터를 다 받아놓고도 `KeyError: '지수명'` 으로
+       통째로 날아갑니다. 이름은 우리가 INDEX_CODES 로 이미 알고 있으니 끕니다.
     """
     fn = getattr(stock, "get_index_ohlcv_by_date", None)
     if fn is not None:
-        return fn(start, end, idx)
-    return stock.get_index_ohlcv(start, end, idx)
+        return fn(start, end, idx, "d", False)
+    return stock.get_index_ohlcv(start, end, idx, "d", False)
 
 
 def _is_etf(code: str) -> bool:
