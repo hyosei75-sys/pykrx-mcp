@@ -534,7 +534,12 @@ def search_ticker(query: str, limit: int = 20) -> dict[str, Any]:
 # ─────────────────────────────────────────────────────────────
 
 TOKEN = os.environ.get("MCP_TOKEN", "").strip()
-PUBLIC_PATHS = ("/", "/healthz")
+
+# ⚠️ /robots.txt 를 인증 뒤에 두면 안 됩니다.
+#    401 이 돌아오면 Claude 의 web_fetch 가 "robots_disallowed" 로 간주해
+#    이 도메인 전체를 거부합니다 (실측 2026-10-27 08:15 브리핑 실패 원인).
+#    크롤링 걱정은 불필요합니다 — 실제 데이터는 전부 토큰 뒤에 있습니다.
+PUBLIC_PATHS = ("/", "/healthz", "/robots.txt")
 
 
 class TokenAuth:
@@ -686,6 +691,14 @@ async def healthz(_request):
     return JSONResponse({"ok": True, "kst": today_kst().strftime("%Y-%m-%d %H:%M:%S")})
 
 
+async def robots(_request):
+    """
+    모든 경로 허용. 이 파일이 401·404 면 web_fetch 가 도메인 전체를 거부합니다.
+    데이터는 토큰 경로 뒤에 있으므로 크롤러에게 노출되지 않습니다.
+    """
+    return PlainTextResponse("User-agent: *\nAllow: /\n")
+
+
 # ⚠️ MCP SDK는 DNS 리바인딩 보호가 기본 ON 이라, Railway 도메인으로 들어오는 요청을
 #    Host 헤더 불일치로 거부합니다. 이게 "커넥터가 안 붙는" 가장 흔한 원인입니다.
 #    ALLOWED_HOSTS 를 지정하면 그 목록만 허용하고, 비워두면 보호를 끕니다.
@@ -710,7 +723,8 @@ _mcp_app = mcp.streamable_http_app(
 #    대신 MCP 앱을 그대로 쓰고 라우트와 미들웨어만 얹습니다.
 app = _mcp_app
 # MCP 앱보다 앞에 꽂아야 /api/* 가 MCP 라우트에 먹히지 않습니다.
-for _i, _r in enumerate([Route("/", root), Route("/healthz", healthz), *API_ROUTES]):
+for _i, _r in enumerate([Route("/", root), Route("/healthz", healthz),
+                         Route("/robots.txt", robots), *API_ROUTES]):
     app.router.routes.insert(_i, _r)
 app.add_middleware(TokenAuth)
 
