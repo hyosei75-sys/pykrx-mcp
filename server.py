@@ -455,25 +455,63 @@ def search_ticker(query: str, limit: int = 20) -> dict[str, Any]:
 # ─────────────────────────────────────────────────────────────
 
 TOKEN = os.environ.get("MCP_TOKEN", "").strip()
+PUBLIC_PATHS = ("/", "/healthz")
 
 
-class BearerAuth(BaseHTTPMiddleware):
-    """MCP_TOKEN 이 설정돼 있으면 Authorization 헤더를 검사합니다."""
+class TokenAuth:
+    """
+    토큰을 두 가지 방법으로 받습니다.
 
-    async def dispatch(self, request, call_next):
-        if request.url.path in ("/", "/healthz"):
-            return await call_next(request)
-        if TOKEN:
-            sent = request.headers.get("authorization", "")
-            if sent != f"Bearer {TOKEN}":
-                return JSONResponse({"error": "unauthorized"}, status_code=401)
-        return await call_next(request)
+    1) 헤더:  Authorization: Bearer <MCP_TOKEN>
+    2) 경로:  /t/<MCP_TOKEN>/mcp      ← 접두사를 떼고 /mcp 로 넘깁니다
+
+    (2)가 필요한 이유: Claude 커스텀 커넥터의 "요청 헤더" 기능은 커스텀 헤더
+    이름마다 Anthropic 승인이 필요하고, `Authorization` 은 Claude가 OAuth용으로
+    이미 쓰고 있어 커스텀 헤더로 지정할 수 없습니다. 경로에 토큰을 넣으면
+    헤더 설정 없이 "No sign in" 만으로 붙습니다.
+
+    ⚠️ 경로 방식은 토큰이 URL에 노출됩니다. 접근 로그에 남을 수 있으니
+       이 URL을 공유하지 마세요. 유출이 의심되면 Render에서 MCP_TOKEN 을
+       새 값으로 바꾸면 기존 URL은 즉시 무효가 됩니다.
+
+    BaseHTTPMiddleware 가 아니라 순수 ASGI 미들웨어인 이유는 경로를 고쳐 써야
+    하기 때문입니다.
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+
+        path: str = scope.get("path", "")
+
+        if path in PUBLIC_PATHS or not TOKEN:
+            return await self.app(scope, receive, send)
+
+        # (2) 경로 방식
+        prefix = f"/t/{TOKEN}"
+        if path == prefix or path.startswith(prefix + "/"):
+            rest = path[len(prefix):] or "/"
+            scope = dict(scope)
+            scope["path"] = rest
+            scope["raw_path"] = rest.encode()
+            return await self.app(scope, receive, send)
+
+        # (1) 헤더 방식
+        for k, v in scope.get("headers", []):
+            if k == b"authorization" and v.decode(errors="ignore") == f"Bearer {TOKEN}":
+                return await self.app(scope, receive, send)
+
+        await JSONResponse({"error": "unauthorized"}, status_code=401)(scope, receive, send)
 
 
 async def root(_request):
     return PlainTextResponse(
-        "pykrx MCP server. MCP endpoint: /mcp\n"
-        "읽기 전용 · KRX via pykrx\n"
+        "pykrx MCP server (읽기 전용 · KRX via pykrx)\n"
+        "MCP endpoint: /mcp  (Authorization: Bearer <MCP_TOKEN>)\n"
+        "          또는 /t/<MCP_TOKEN>/mcp  (헤더 불필요)\n"
     )
 
 
@@ -506,7 +544,7 @@ _mcp_app = mcp.streamable_http_app(
 app = _mcp_app
 app.router.routes.insert(0, Route("/", root))
 app.router.routes.insert(1, Route("/healthz", healthz))
-app.add_middleware(BearerAuth)
+app.add_middleware(TokenAuth)
 
 
 if __name__ == "__main__":
