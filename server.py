@@ -586,6 +586,94 @@ class TokenAuth:
         await JSONResponse({"error": "unauthorized"}, status_code=401)(scope, receive, send)
 
 
+# ─────────────────────────────────────────────────────────────
+# REST (GET) 엔드포인트
+#
+# 왜 필요한가: 예약 작업 세션에 커스텀 커넥터가 노출되지 않는 경우가 있습니다
+# (2026-10-27 실측: 07:22 실행에서 "pykrx 커넥터 세션에 미등록").
+# web_fetch 는 GET 전용·헤더 지정 불가지만 **어떤 세션에서도 동작**하므로,
+# 토큰이 경로에 들어간 GET 엔드포인트를 열어 커넥터 없이도 쓸 수 있게 합니다.
+#
+#   GET /t/<MCP_TOKEN>/api/health
+#   GET /t/<MCP_TOKEN>/api/quote/0219E0
+#   GET /t/<MCP_TOKEN>/api/ohlcv/069500?months=12
+#   GET /t/<MCP_TOKEN>/api/index/KOSPI?months=12
+#   GET /t/<MCP_TOKEN>/api/etf/0219E0?days=20
+#   GET /t/<MCP_TOKEN>/api/investor/005930?days=20
+#   GET /t/<MCP_TOKEN>/api/short/005930?days=20
+#   GET /t/<MCP_TOKEN>/api/search?q=커버드콜
+#
+# 응답 JSON은 같은 이름의 MCP 도구와 **완전히 동일**합니다.
+# 인증은 TokenAuth 미들웨어가 경로 접두사로 이미 처리합니다.
+# ─────────────────────────────────────────────────────────────
+
+def _int_param(request, name, default):
+    try:
+        return int(request.query_params.get(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def _json(obj):
+    return JSONResponse(obj, media_type="application/json; charset=utf-8")
+
+
+async def api_health(_request):
+    return _json(health())
+
+
+async def api_quote(request):
+    return _json(get_quote(request.path_params["code"]))
+
+
+async def api_ohlcv(request):
+    return _json(get_ohlcv(request.path_params["code"],
+                           months=_int_param(request, "months", 12)))
+
+
+async def api_index(request):
+    idx = request.path_params["index"].upper()
+    if idx not in INDEX_CODES:
+        return JSONResponse(
+            {"error": f"알 수 없는 지수: {idx}",
+             "allowed": sorted(INDEX_CODES)}, status_code=400)
+    return _json(get_index_ohlcv(idx, months=_int_param(request, "months", 12)))
+
+
+async def api_etf(request):
+    return _json(get_etf_detail(request.path_params["code"],
+                                days=_int_param(request, "days", 20)))
+
+
+async def api_investor(request):
+    return _json(get_investor_trading(request.path_params["code"],
+                                      days=_int_param(request, "days", 20)))
+
+
+async def api_short(request):
+    return _json(get_short_selling(request.path_params["code"],
+                                   days=_int_param(request, "days", 20)))
+
+
+async def api_search(request):
+    q = request.query_params.get("q", "").strip()
+    if not q:
+        return JSONResponse({"error": "q 파라미터가 필요합니다"}, status_code=400)
+    return _json(search_ticker(q, limit=_int_param(request, "limit", 20)))
+
+
+API_ROUTES = [
+    Route("/api/health", api_health),
+    Route("/api/quote/{code}", api_quote),
+    Route("/api/ohlcv/{code}", api_ohlcv),
+    Route("/api/index/{index}", api_index),
+    Route("/api/etf/{code}", api_etf),
+    Route("/api/investor/{code}", api_investor),
+    Route("/api/short/{code}", api_short),
+    Route("/api/search", api_search),
+]
+
+
 async def root(_request):
     return PlainTextResponse(
         "pykrx MCP server (읽기 전용 · KRX via pykrx)\n"
@@ -621,8 +709,9 @@ _mcp_app = mcp.streamable_http_app(
 #    "Task group is not initialized" 500 으로 떨어집니다.
 #    대신 MCP 앱을 그대로 쓰고 라우트와 미들웨어만 얹습니다.
 app = _mcp_app
-app.router.routes.insert(0, Route("/", root))
-app.router.routes.insert(1, Route("/healthz", healthz))
+# MCP 앱보다 앞에 꽂아야 /api/* 가 MCP 라우트에 먹히지 않습니다.
+for _i, _r in enumerate([Route("/", root), Route("/healthz", healthz), *API_ROUTES]):
+    app.router.routes.insert(_i, _r)
 app.add_middleware(TokenAuth)
 
 
