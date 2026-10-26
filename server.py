@@ -145,6 +145,40 @@ def _frame(code: str, start: str, end: str) -> tuple[pd.DataFrame, str]:
     return pd.DataFrame(), "unknown"
 
 
+COMPACT_COLS = ["시가", "고가", "저가", "종가", "거래량"]
+
+
+def _compact(df: pd.DataFrame, limit: int = MAX_ROWS) -> dict[str, Any]:
+    """
+    차트·지표 계산용 압축 포맷.
+
+    왜 필요한가: 12개월 = 약 248봉인데, 봉마다 한글 키가 붙은 dict 로 돌려주면
+    한 종목에 1.5만 토큰 가까이 됩니다. 지수 5종이면 그것만으로 세션 예산이
+    말라붙습니다. 열 이름을 한 번만 쓰고 값은 배열로 보내 3~4배 줄입니다.
+
+    반환: {"columns": ["date","시가",...], "rows": [["2026-01-02", 1,2,3,4,5], ...]}
+    """
+    if df is None or df.empty:
+        return {"columns": [], "rows": []}
+    df = df.tail(limit)
+    cols = [c for c in COMPACT_COLS if c in df.columns]
+    rows: list[list[Any]] = []
+    for idx, row in df.iterrows():
+        rec: list[Any] = [pd.Timestamp(idx).strftime("%Y-%m-%d")]
+        for c in cols:
+            v = row[c]
+            if pd.isna(v):
+                rec.append(None)
+            elif isinstance(v, float):
+                rec.append(round(v, 2))
+            elif hasattr(v, "item"):
+                rec.append(v.item())
+            else:
+                rec.append(v)
+        rows.append(rec)
+    return {"columns": ["date"] + cols, "rows": rows}
+
+
 def _rows(df: pd.DataFrame, limit: int = MAX_ROWS) -> list[dict[str, Any]]:
     """DataFrame → JSON 직렬화 가능한 행 목록. 날짜는 YYYY-MM-DD."""
     if df is None or df.empty:
@@ -264,7 +298,7 @@ def get_quote(code: str) -> dict[str, Any]:
 
 
 @mcp.tool()
-def get_ohlcv(code: str, months: int = 12) -> dict[str, Any]:
+def get_ohlcv(code: str, months: int = 12, compact: bool = True) -> dict[str, Any]:
     """
     종목의 일봉 OHLCV 이력을 조회합니다. **KIS의 100건 제한이 없습니다.**
 
@@ -273,55 +307,81 @@ def get_ohlcv(code: str, months: int = 12) -> dict[str, Any]:
     Args:
         code: 6자리 종목코드
         months: 조회 개월 수 (기본 12, 최대 24)
+        compact: True(기본)면 columns/rows 배열로 압축해 반환합니다.
+                 12개월이면 응답이 3~4배 작아집니다. **그대로 두세요.**
+                 False 는 봉마다 한글 키가 붙은 dict 라 토큰을 크게 씁니다.
     """
     code = code.strip().upper()
     months = max(1, min(int(months), 24))
     df, kind = _frame(code, months_ago(months), ymd(today_kst()))
-    bars = _rows(df)
-    return {
+    out: dict[str, Any] = {
         "code": code,
         "name": _name(code),
         "kind": kind,
         "months": months,
-        "count": len(bars),
-        "first_date": bars[0]["date"] if bars else None,
-        "last_date": bars[-1]["date"] if bars else None,
-        "bars": bars,
         "source": "KRX via pykrx",
     }
+    if compact:
+        c = _compact(df)
+        out["count"] = len(c["rows"])
+        out["first_date"] = c["rows"][0][0] if c["rows"] else None
+        out["last_date"] = c["rows"][-1][0] if c["rows"] else None
+        out["columns"] = c["columns"]
+        out["rows"] = c["rows"]
+    else:
+        bars = _rows(df)
+        out["count"] = len(bars)
+        out["first_date"] = bars[0]["date"] if bars else None
+        out["last_date"] = bars[-1]["date"] if bars else None
+        out["bars"] = bars
+    return out
 
 
 @mcp.tool()
 def get_index_ohlcv(
     index: Literal["KOSPI", "KOSDAQ", "KOSPI200"] = "KOSPI",
     months: int = 12,
+    compact: bool = True,
 ) -> dict[str, Any]:
     """
     국내 지수의 일봉 이력을 조회합니다. 12개월 지수 차트용.
 
+    ⚠️ 빈 응답(count=0)이 오면 KRX가 비로그인 접근을 막은 것일 수 있습니다.
+       Render 환경변수 `KRX_ID` / `KRX_PW` 를 설정하면 해결됩니다.
+
     Args:
         index: KOSPI | KOSDAQ | KOSPI200
         months: 조회 개월 수 (기본 12, 최대 24)
+        compact: True(기본)면 columns/rows 배열로 압축. 그대로 두세요.
     """
     months = max(1, min(int(months), 24))
     idx = INDEX_CODES[index]
+    out: dict[str, Any] = {
+        "index": index, "krx_code": idx, "months": months,
+        "krx_login": bool(os.environ.get("KRX_ID") and os.environ.get("KRX_PW")),
+        "source": "KRX via pykrx",
+    }
     try:
         df = _index_ohlcv(idx, months_ago(months), ymd(today_kst()))
     except Exception as e:
-        return {"index": index, "count": 0, "bars": [],
-                "error": f"{type(e).__name__}: {e}",
-                "source": "KRX via pykrx"}
-    bars = _rows(df)
-    return {
-        "index": index,
-        "krx_code": idx,
-        "months": months,
-        "count": len(bars),
-        "first_date": bars[0]["date"] if bars else None,
-        "last_date": bars[-1]["date"] if bars else None,
-        "bars": bars,
-        "source": "KRX via pykrx",
-    }
+        out.update({"count": 0, "rows": [], "error": f"{type(e).__name__}: {e}"})
+        return out
+
+    if compact:
+        c = _compact(df)
+        out["count"] = len(c["rows"])
+        out["first_date"] = c["rows"][0][0] if c["rows"] else None
+        out["last_date"] = c["rows"][-1][0] if c["rows"] else None
+        out["columns"] = c["columns"]
+        out["rows"] = c["rows"]
+    else:
+        bars = _rows(df)
+        out["count"] = len(bars)
+        out["bars"] = bars
+    if not out["count"]:
+        out["hint"] = ("빈 응답입니다. KRX 비로그인 제한일 가능성이 큽니다 — "
+                       "Render 에 KRX_ID / KRX_PW 를 설정해 보세요.")
+    return out
 
 
 @mcp.tool()
