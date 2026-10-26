@@ -1,0 +1,5 @@
+mcp>=1.2.0
+pykrx>=1.0.45
+pandas>=2.0.0
+starlette>=0.37.0
+uvicorn[standard]>=0.30.0
