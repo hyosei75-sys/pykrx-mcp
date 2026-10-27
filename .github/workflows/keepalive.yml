@@ -1,0 +1,51 @@
+# .github/workflows/keepalive.yml
+#
+# Render 무료 플랜은 외부 트래픽이 15분 없으면 인스턴스를 재웁니다.
+# 잠든 상태에서는 Claude 예약 작업의 MCP 커넥터 핸드셰이크가
+# (세션 시작에 한 번, 짧은 타임아웃으로만 시도되므로) 실패합니다.
+#
+# 10분마다 /healthz 를 찔러 깨어 있게 유지합니다.
+#
+# ⚠️ Actions 무료 한도: Public 저장소는 무제한, Private 은 월 2,000분이고
+#    실행마다 1분으로 올림 과금되어 이 주기로는 한도를 넘습니다.
+#    → 이 워크플로는 **저장소가 Public 일 때만** 쓰세요.
+#
+# ⚠️ GitHub 의 schedule 은 지연될 수 있습니다(수 분~십수 분).
+#    그래서 15분 임계값에 여유를 두려고 10분이 아니라 */8 로 잡았습니다.
+
+name: keepalive
+
+on:
+  schedule:
+    - cron: "*/8 * * * *"
+  workflow_dispatch:        # 수동 실행 버튼
+
+permissions:
+  contents: read
+
+concurrency:
+  group: keepalive
+  cancel-in-progress: false
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Ping /healthz
+        run: |
+          URL="https://pykrx-mcp.onrender.com/healthz"
+          # 잠들어 있으면 기동에 50초 이상 걸리므로 넉넉히 기다립니다.
+          for i in 1 2 3; do
+            CODE=$(curl -s -o /tmp/out.json -w '%{http_code}' --max-time 120 "$URL" || echo 000)
+            echo "시도 $i → HTTP $CODE"
+            if [ "$CODE" = "200" ]; then
+              cat /tmp/out.json
+              echo
+              exit 0
+            fi
+            sleep 15
+          done
+          echo "::warning::3회 모두 실패 — Render 배포 상태를 확인하세요"
+          # 핑 실패로 워크플로를 빨갛게 만들지 않습니다 (알림 소음 방지).
+          exit 0
