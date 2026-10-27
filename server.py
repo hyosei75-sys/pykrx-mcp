@@ -22,6 +22,7 @@ Streamable HTTP. Claude 커스텀 커넥터가 바로 붙습니다.
 from __future__ import annotations
 
 import os
+import time
 import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
@@ -86,11 +87,39 @@ def days_ago(n: int) -> str:
 # 배포 환경에서 조용히 AttributeError 가 나지 않도록 둘 다 시도합니다.
 # ─────────────────────────────────────────────────────────────
 
+def _retry(fn, *args, tries: int = 3, **kwargs):
+    """
+    KRX 호출 재시도.
+
+    왜: 브리핑이 여러 종목을 연달아 조회하면 KRX가 일부 요청을 순간적으로 거부합니다
+    (실측 2026-10-27 16:05: 같은 엔드포인트가 단독 호출은 성공, 연속 호출 중에는
+    SERVER_ERROR). 호출자가 매번 대응하게 두지 말고 서버에서 흡수합니다.
+
+    빈 DataFrame 도 재시도 대상입니다 — KRX 는 실패를 빈 응답으로 돌려주기도 합니다.
+    단 휴장일처럼 **정상적으로 비어 있는** 경우가 있으므로 마지막 결과를 그대로 반환합니다.
+    """
+    last_err: Exception | None = None
+    out = None
+    for i in range(tries):
+        try:
+            out = fn(*args, **kwargs)
+            if out is not None and not (isinstance(out, pd.DataFrame) and out.empty):
+                return out
+        except Exception as e:
+            last_err = e
+            log.warning("KRX 호출 실패 (%d/%d): %s", i + 1, tries, e)
+        if i < tries - 1:
+            time.sleep(1.5 * (i + 1))      # 1.5s → 3.0s
+    if out is None and last_err is not None:
+        raise last_err
+    return out if out is not None else pd.DataFrame()
+
+
 def _call(primary: str, fallback: str, *args) -> pd.DataFrame:
     fn = getattr(stock, primary, None) or getattr(stock, fallback, None)
     if fn is None:
         raise RuntimeError(f"pykrx에 {primary}/{fallback} 가 없습니다. 버전을 확인하세요.")
-    return fn(*args)
+    return _retry(fn, *args)
 
 
 def _ohlcv(code: str, start: str, end: str) -> pd.DataFrame:
@@ -117,8 +146,8 @@ def _index_ohlcv(idx: str, start: str, end: str) -> pd.DataFrame:
     """
     fn = getattr(stock, "get_index_ohlcv_by_date", None)
     if fn is not None:
-        return fn(start, end, idx, "d", False)
-    return stock.get_index_ohlcv(start, end, idx, "d", False)
+        return _retry(fn, start, end, idx, "d", False)
+    return _retry(stock.get_index_ohlcv, start, end, idx, "d", False)
 
 
 def _is_etf(code: str) -> bool:
