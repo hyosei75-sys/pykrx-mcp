@@ -30,6 +30,8 @@ from typing import Any, Literal
 import pandas as pd
 from pykrx import stock
 
+import indicators          # 같은 폴더. 지표 계산을 서버에서 수행
+
 # MCP SDK 2.x 에서 FastMCP 가 MCPServer 로 이름이 바뀌었습니다.
 # 어느 버전이 깔려도 돌아가게 둘 다 시도합니다.
 try:
@@ -689,6 +691,109 @@ async def api_short(request):
                                    days=_int_param(request, "days", 20)))
 
 
+def _bars_for_indicators(df: pd.DataFrame) -> list[dict[str, Any]]:
+    """indicators.analyze 가 먹는 dict 배열로 변환 (한글 키는 normalize 가 인식)."""
+    out = []
+    for idx, row in df.iterrows():
+        rec: dict[str, Any] = {"date": pd.Timestamp(idx).strftime("%Y-%m-%d")}
+        for k in ("시가", "고가", "저가", "종가", "거래량"):
+            if k in row and not pd.isna(row[k]):
+                v = row[k]
+                rec[k] = v.item() if hasattr(v, "item") else v
+        out.append(rec)
+    return out
+
+
+async def _indicators_payload(df, label, months, kind=None):
+    """
+    일봉을 서버에서 계산해 **결과만** 돌려줍니다.
+
+    왜: 12개월 일봉(약 248봉)을 그대로 보내면 종목당 5~6천 토큰이라
+    보유 종목 + 지수를 합치면 세션 전송량 한도를 넘습니다
+    (실측 2026-10-28 07:19: 지표 5종목·차트 전부 생략됨).
+    계산 결과만 보내면 **약 450 토큰** 으로 13배 줄어듭니다.
+    """
+    bars = _bars_for_indicators(df)
+    if len(bars) < 15:
+        return {"name": label, "months": months, "ok": False,
+                "reason": f"봉 부족 ({len(bars)}개)", "source": "KRX via pykrx"}
+    res = indicators.analyze(bars)
+    res["name"] = label
+    res["months"] = months
+    if kind:
+        res["kind"] = kind
+    res["source"] = "KRX via pykrx"
+    return res
+
+
+async def api_indicators(request):
+    code = request.path_params["code"].strip().upper()
+    months = max(3, min(_int_param(request, "months", 12), 24))
+    df, kind = _frame(code, months_ago(months), ymd(today_kst()))
+    return _json(await _indicators_payload(df, _name(code) or code, months, kind))
+
+
+async def api_idx_indicators(request):
+    idx = request.path_params["index"].upper()
+    if idx not in INDEX_CODES:
+        return JSONResponse({"error": f"알 수 없는 지수: {idx}",
+                             "allowed": sorted(INDEX_CODES)}, status_code=400)
+    months = max(3, min(_int_param(request, "months", 12), 24))
+    try:
+        df = _index_ohlcv(INDEX_CODES[idx], months_ago(months), ymd(today_kst()))
+    except Exception as e:
+        return _json({"name": idx, "months": months, "ok": False,
+                      "error": f"{type(e).__name__}: {e}",
+                      "hint": "KRX 접근 실패. KRX_ID/KRX_PW 설정 여부를 확인하세요.",
+                      "source": "KRX via pykrx"})
+    return _json(await _indicators_payload(df, idx, months, "index"))
+
+
+CHART_COLS = ["고가", "저가", "종가", "거래량"]      # 시가는 차트에 쓰지 않음
+
+
+def _chartdata(df: pd.DataFrame, label: str, months: int) -> dict[str, Any]:
+    """
+    차트 전용 최소 필드. make_charts.py 는 종가선·일목·MACD·RSI·OBV 만 그리므로
+    **시가는 필요 없습니다.** 소수점도 버려 전송량을 더 줄입니다.
+    pykrx_adapter.py 가 그대로 받습니다.
+    """
+    cols = [c for c in CHART_COLS if c in df.columns]
+    rows = []
+    for idx, row in df.iterrows():
+        rec: list[Any] = [pd.Timestamp(idx).strftime("%Y-%m-%d")]
+        for c in cols:
+            v = row[c]
+            rec.append(None if pd.isna(v) else (round(float(v), 2) if c != "거래량" else int(v)))
+        rows.append(rec)
+    return {"name": label, "months": months, "count": len(rows),
+            "columns": ["date"] + cols, "rows": rows, "source": "KRX via pykrx"}
+
+
+async def api_chartdata(request):
+    code = request.path_params["code"].strip().upper()
+    months = max(3, min(_int_param(request, "months", 12), 24))
+    df, _k = _frame(code, months_ago(months), ymd(today_kst()))
+    return _json(_chartdata(df, _name(code) or code, months))
+
+
+async def api_idx_chartdata(request):
+    idx = request.path_params["index"].upper()
+    if idx not in INDEX_CODES:
+        return JSONResponse({"error": f"알 수 없는 지수: {idx}",
+                             "allowed": sorted(INDEX_CODES)}, status_code=400)
+    months = max(3, min(_int_param(request, "months", 12), 24))
+    try:
+        df = _index_ohlcv(INDEX_CODES[idx], months_ago(months), ymd(today_kst()))
+    except Exception as e:
+        return _json({"name": idx, "months": months, "count": 0,
+                      "columns": [], "rows": [],
+                      "error": f"{type(e).__name__}: {e}",
+                      "hint": "KRX 접근 실패. KRX_ID/KRX_PW 설정 여부를 확인하세요.",
+                      "source": "KRX via pykrx"})
+    return _json(_chartdata(df, idx, months))
+
+
 async def api_search(request):
     q = request.query_params.get("q", "").strip()
     if not q:
@@ -704,6 +809,10 @@ API_ROUTES = [
     Route("/api/etf/{code}", api_etf),
     Route("/api/investor/{code}", api_investor),
     Route("/api/short/{code}", api_short),
+    Route("/api/indicators/{code}", api_indicators),
+    Route("/api/idx-indicators/{index}", api_idx_indicators),
+    Route("/api/chartdata/{code}", api_chartdata),
+    Route("/api/idx-chartdata/{index}", api_idx_chartdata),
     Route("/api/search", api_search),
 ]
 
