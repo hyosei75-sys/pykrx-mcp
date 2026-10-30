@@ -812,6 +812,9 @@ async def api_idx_chartdata(request):
 
 KAKAO_KEY = os.environ.get("KAKAO_REST_API_KEY", "").strip()
 KAKAO_REFRESH = os.environ.get("KAKAO_REFRESH_TOKEN", "").strip()
+# 카카오는 REST API 키 생성 시 클라이언트 시크릿을 기본 활성화합니다.
+# 활성화 상태면 토큰 요청에 client_secret 을 반드시 포함해야 합니다.
+KAKAO_SECRET = os.environ.get("KAKAO_CLIENT_SECRET", "").strip()
 KAKAO_REDIRECT = os.environ.get(
     "KAKAO_REDIRECT_URI", "https://pykrx-mcp.onrender.com/kakao/callback").strip()
 
@@ -825,11 +828,14 @@ def _kakao_access_token() -> str:
         return _kakao_tok["access"]
     if not (KAKAO_KEY and KAKAO_REFRESH):
         raise RuntimeError("KAKAO_REST_API_KEY / KAKAO_REFRESH_TOKEN 미설정")
-    r = requests.post("https://kauth.kakao.com/oauth/token", timeout=15, data={
+    payload = {
         "grant_type": "refresh_token",
         "client_id": KAKAO_KEY,
         "refresh_token": KAKAO_REFRESH,
-    })
+    }
+    if KAKAO_SECRET:
+        payload["client_secret"] = KAKAO_SECRET
+    r = requests.post("https://kauth.kakao.com/oauth/token", timeout=15, data=payload)
     d = r.json()
     if "access_token" not in d:
         raise RuntimeError(f"토큰 갱신 실패: {d}")
@@ -890,7 +896,9 @@ async def kakao_setup(request):
         "\n\n② 동의하면 이 서버의 /kakao/callback 으로 돌아오고,\n"
         "   화면에 refresh_token 이 표시됩니다.\n"
         "③ 그 값을 Render 환경변수 KAKAO_REFRESH_TOKEN 에 넣고 저장하세요.\n"
-        "④ 재배포 후 /t/<토큰>/api/kakao?msg=테스트 로 확인하세요.\n")
+        "④ 재배포 후 /t/<토큰>/api/kakao?msg=테스트 로 확인하세요.\n\n"
+        f"현재 클라이언트 시크릿: {'설정됨' if KAKAO_SECRET else '미설정'}\n"
+        "  (카카오 콘솔에서 활성화 ON 이면 반드시 설정해야 합니다)\n")
 
 
 async def kakao_callback(request):
@@ -901,9 +909,11 @@ async def kakao_callback(request):
         return PlainTextResponse("code 파라미터가 없습니다.", status_code=400)
     if not KAKAO_KEY:
         return PlainTextResponse("KAKAO_REST_API_KEY 미설정", status_code=400)
-    r = requests.post("https://kauth.kakao.com/oauth/token", timeout=15, data={
-        "grant_type": "authorization_code", "client_id": KAKAO_KEY,
-        "redirect_uri": KAKAO_REDIRECT, "code": code})
+    payload = {"grant_type": "authorization_code", "client_id": KAKAO_KEY,
+               "redirect_uri": KAKAO_REDIRECT, "code": code}
+    if KAKAO_SECRET:
+        payload["client_secret"] = KAKAO_SECRET
+    r = requests.post("https://kauth.kakao.com/oauth/token", timeout=15, data=payload)
     d = r.json()
     if "refresh_token" not in d:
         return PlainTextResponse(f"교환 실패:\n{r.text[:500]}", status_code=400)
