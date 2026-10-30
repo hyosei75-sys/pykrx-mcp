@@ -570,7 +570,7 @@ TOKEN = os.environ.get("MCP_TOKEN", "").strip()
 #    401 이 돌아오면 Claude 의 web_fetch 가 "robots_disallowed" 로 간주해
 #    이 도메인 전체를 거부합니다 (실측 2026-10-27 08:15 브리핑 실패 원인).
 #    크롤링 걱정은 불필요합니다 — 실제 데이터는 전부 토큰 뒤에 있습니다.
-PUBLIC_PATHS = ("/", "/healthz", "/robots.txt")
+PUBLIC_PATHS = ("/", "/healthz", "/robots.txt", "/kakao/callback")
 
 
 class TokenAuth:
@@ -794,6 +794,127 @@ async def api_idx_chartdata(request):
     return _json(_chartdata(df, idx, months))
 
 
+# ─────────────────────────────────────────────────────────────
+# 카카오톡 "나에게 보내기"
+#
+# 왜 서버에 넣나: PlayMCP 의 KakaotalkChat-MemoChat 은 예약 세션에서 인증이
+# 반나절이면 풀립니다 (실측 2026-10-29~30: 카톡 발송 7회 중 6회 실패).
+# 리프레시 토큰을 서버가 들고 자동 갱신하면 수동 재연결이 필요 없습니다.
+#
+# ⚠️ web_fetch 는 GET 전용이라 POST 를 쓸 수 없습니다.
+#    그래서 메시지를 쿼리스트링으로 받습니다 (부작용 있는 GET — 비표준이지만 불가피).
+#    메시지 내용이 서버 접근 로그에 남을 수 있습니다. 비밀값을 보내지 마세요.
+#
+# 환경변수 (Render):
+#   KAKAO_REST_API_KEY   카카오 디벨로퍼스 앱의 REST API 키
+#   KAKAO_REFRESH_TOKEN  최초 1회 OAuth 동의로 발급 (아래 /kakao/setup 참고)
+# ─────────────────────────────────────────────────────────────
+
+KAKAO_KEY = os.environ.get("KAKAO_REST_API_KEY", "").strip()
+KAKAO_REFRESH = os.environ.get("KAKAO_REFRESH_TOKEN", "").strip()
+KAKAO_REDIRECT = os.environ.get(
+    "KAKAO_REDIRECT_URI", "https://pykrx-mcp.onrender.com/kakao/callback").strip()
+
+_kakao_tok: dict[str, Any] = {"access": None, "exp": 0.0}
+
+
+def _kakao_access_token() -> str:
+    """리프레시 토큰으로 액세스 토큰을 받아옵니다. 만료 5분 전까지 재사용."""
+    import requests
+    if _kakao_tok["access"] and time.time() < _kakao_tok["exp"] - 300:
+        return _kakao_tok["access"]
+    if not (KAKAO_KEY and KAKAO_REFRESH):
+        raise RuntimeError("KAKAO_REST_API_KEY / KAKAO_REFRESH_TOKEN 미설정")
+    r = requests.post("https://kauth.kakao.com/oauth/token", timeout=15, data={
+        "grant_type": "refresh_token",
+        "client_id": KAKAO_KEY,
+        "refresh_token": KAKAO_REFRESH,
+    })
+    d = r.json()
+    if "access_token" not in d:
+        raise RuntimeError(f"토큰 갱신 실패: {d}")
+    _kakao_tok["access"] = d["access_token"]
+    _kakao_tok["exp"] = time.time() + int(d.get("expires_in", 3600))
+    # 카카오가 리프레시 토큰을 갱신해 주는 경우가 있습니다(만료 1개월 이내).
+    if d.get("refresh_token"):
+        log.warning("카카오가 새 refresh_token 을 발급했습니다. "
+                    "Render 의 KAKAO_REFRESH_TOKEN 을 갱신하세요.")
+    return _kakao_tok["access"]
+
+
+async def api_kakao_send(request):
+    """
+    GET /t/<TOKEN>/api/kakao?msg=<본문>
+
+    `msg` 는 URL 인코딩된 평문. 카카오 제한에 맞춰 200자를 넘으면 자릅니다.
+    """
+    import json as _jsonlib
+    import requests
+    msg = (request.query_params.get("msg") or "").strip()
+    if not msg:
+        return JSONResponse({"ok": False, "error": "msg 파라미터가 필요합니다"},
+                            status_code=400)
+    truncated = False
+    if len(msg) > 200:
+        msg, truncated = msg[:197] + "...", True
+    try:
+        tok = _kakao_access_token()
+        r = requests.post(
+            "https://kapi.kakao.com/v2/api/talk/memo/default/send",
+            headers={"Authorization": f"Bearer {tok}"}, timeout=15,
+            data={"template_object": _jsonlib.dumps({
+                "object_type": "text", "text": msg,
+                "link": {"web_url": "https://markets.hankyung.com",
+                         "mobile_web_url": "https://markets.hankyung.com"},
+            }, ensure_ascii=False)})
+        ok = r.status_code == 200 and r.json().get("result_code") == 0
+        return _json({"ok": ok, "chars": len(msg), "truncated": truncated,
+                      "status": r.status_code,
+                      "detail": None if ok else r.text[:300]})
+    except Exception as e:
+        return _json({"ok": False, "error": f"{type(e).__name__}: {e}"})
+
+
+async def kakao_setup(request):
+    """최초 설정 안내 — 동의 URL 을 보여줍니다."""
+    if not KAKAO_KEY:
+        return PlainTextResponse(
+            "KAKAO_REST_API_KEY 가 설정되지 않았습니다.\n"
+            "Render → Environment 에 추가한 뒤 다시 여세요.\n", status_code=400)
+    from urllib.parse import urlencode
+    url = "https://kauth.kakao.com/oauth/authorize?" + urlencode({
+        "client_id": KAKAO_KEY, "redirect_uri": KAKAO_REDIRECT,
+        "response_type": "code", "scope": "talk_message"})
+    return PlainTextResponse(
+        "① 아래 주소를 브라우저에서 열어 동의하세요:\n\n" + url +
+        "\n\n② 동의하면 이 서버의 /kakao/callback 으로 돌아오고,\n"
+        "   화면에 refresh_token 이 표시됩니다.\n"
+        "③ 그 값을 Render 환경변수 KAKAO_REFRESH_TOKEN 에 넣고 저장하세요.\n"
+        "④ 재배포 후 /t/<토큰>/api/kakao?msg=테스트 로 확인하세요.\n")
+
+
+async def kakao_callback(request):
+    """카카오 동의 후 code → refresh_token 교환. 값은 화면에만 표시합니다."""
+    import requests
+    code = request.query_params.get("code")
+    if not code:
+        return PlainTextResponse("code 파라미터가 없습니다.", status_code=400)
+    if not KAKAO_KEY:
+        return PlainTextResponse("KAKAO_REST_API_KEY 미설정", status_code=400)
+    r = requests.post("https://kauth.kakao.com/oauth/token", timeout=15, data={
+        "grant_type": "authorization_code", "client_id": KAKAO_KEY,
+        "redirect_uri": KAKAO_REDIRECT, "code": code})
+    d = r.json()
+    if "refresh_token" not in d:
+        return PlainTextResponse(f"교환 실패:\n{r.text[:500]}", status_code=400)
+    return PlainTextResponse(
+        "발급되었습니다. 아래 값을 Render 환경변수 KAKAO_REFRESH_TOKEN 에 넣으세요.\n"
+        "이 화면을 닫으면 다시 볼 수 없습니다. 아무에게도 공유하지 마세요.\n\n"
+        f"KAKAO_REFRESH_TOKEN =\n{d['refresh_token']}\n\n"
+        f"(유효기간 약 {int(d.get('refresh_token_expires_in', 0))//86400}일. "
+        "사용할 때마다 카카오가 자동 연장합니다.)\n")
+
+
 async def api_search(request):
     q = request.query_params.get("q", "").strip()
     if not q:
@@ -814,6 +935,8 @@ API_ROUTES = [
     Route("/api/chartdata/{code}", api_chartdata),
     Route("/api/idx-chartdata/{index}", api_idx_chartdata),
     Route("/api/search", api_search),
+    Route("/api/kakao", api_kakao_send),
+    Route("/kakao/setup", kakao_setup),
 ]
 
 
@@ -862,7 +985,8 @@ _mcp_app = mcp.streamable_http_app(
 app = _mcp_app
 # MCP 앱보다 앞에 꽂아야 /api/* 가 MCP 라우트에 먹히지 않습니다.
 for _i, _r in enumerate([Route("/", root), Route("/healthz", healthz),
-                         Route("/robots.txt", robots), *API_ROUTES]):
+                         Route("/robots.txt", robots),
+                         Route("/kakao/callback", kakao_callback), *API_ROUTES]):
     app.router.routes.insert(_i, _r)
 app.add_middleware(TokenAuth)
 
